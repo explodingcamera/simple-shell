@@ -1,45 +1,57 @@
-use core::fmt::Write;
+use crate::{CallbackResult, Error, Result};
 
-pub(crate) struct ShellWriter {
-    print: fn(&str),
+/// Calls the output adapter and retains its first error.
+pub(crate) struct ShellWriter<R: CallbackResult> {
+    print: fn(&str) -> R,
+    pub(super) error: Option<Error>,
+    /// Display column after the last write, ignoring ANSI escape sequences.
+    pub(super) column: usize,
+    escape: bool,
+    csi: bool,
 }
 
-impl core::fmt::Write for ShellWriter {
+impl<R: CallbackResult> core::fmt::Write for ShellWriter<R> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        (self.print)(s);
+        if self.error.is_some() {
+            return Err(core::fmt::Error);
+        }
+        (self.print)(s).into_result().map_err(|error| {
+            self.error = Some(error);
+            core::fmt::Error
+        })?;
+        for character in s.chars() {
+            if self.csi {
+                self.csi = !('@'..='~').contains(&character);
+            } else if self.escape {
+                self.escape = false;
+                self.csi = character == '[';
+            } else {
+                match character {
+                    '\x1b' => self.escape = true,
+                    '\r' | '\n' => self.column = 0,
+                    c if !c.is_control() => self.column += 1,
+                    _ => {}
+                }
+            }
+        }
         Ok(())
     }
 }
 
-impl ShellWriter {
-    pub fn new(print: fn(&str)) -> Self {
-        Self { print }
+impl<R: CallbackResult> ShellWriter<R> {
+    /// Creates a writer with no pending output error.
+    pub fn new(print: fn(&str) -> R) -> Self {
+        Self {
+            print,
+            error: None,
+            column: 0,
+            escape: false,
+            csi: false,
+        }
     }
 
-    pub fn print(&mut self, t: &str) {
-        self.write_str(t).unwrap();
-    }
-
-    pub fn print_args(&mut self, t: core::fmt::Arguments) {
-        self.write_fmt(t).unwrap();
-    }
-}
-
-macro_rules! print {
-    ($writer:expr, $fmt:literal$(, $($arg: tt)+)?) => {
-        $writer.print_args(format_args!($fmt $(,$($arg)+)?))
+    /// Takes the original error so the run loop can stop before reading more input.
+    pub fn take_error(&mut self) -> Result {
+        self.error.take().map_or(Ok(()), Err)
     }
 }
-
-macro_rules! println {
-    ($writer:expr, $fmt:literal$(, $($arg: tt)+)?) => {{
-        $crate::print!($writer, $fmt $(,$($arg)+)?);
-        $writer.print("\n");
-    }};
-    () => {
-      $writer.print("\n");
-    }
-}
-
-pub(crate) use print;
-pub(crate) use println;
