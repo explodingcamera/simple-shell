@@ -7,6 +7,8 @@ pub enum Error {
     LineTooLong,
     /// Input exceeded the fixed argument capacity, including the command name.
     TooManyArguments,
+    /// A quoted argument has no closing quote.
+    UnclosedQuote,
     /// A static error message, stored without allocation.
     Message(&'static str),
     /// No command matched the input.
@@ -16,6 +18,9 @@ pub enum Error {
     /// An I/O error from a standard-library adapter.
     #[cfg(feature = "std")]
     Io(std::io::Error),
+    /// An I/O error from an `embedded-io` adapter.
+    #[cfg(feature = "embedded-io")]
+    EmbeddedIo(embedded_io::ErrorKind),
 }
 
 /// The shell's result type.
@@ -26,11 +31,14 @@ impl fmt::Display for Error {
         match self {
             Self::LineTooLong => output.write_str("command buffer is full"),
             Self::TooManyArguments => output.write_str("command exceeds 64 arguments"),
+            Self::UnclosedQuote => output.write_str("unclosed quote"),
             Self::Message(message) => output.write_str(message),
             Self::CommandNotFound => output.write_str("command not found"),
             Self::Formatting => output.write_str("formatting failed"),
             #[cfg(feature = "std")]
             Self::Io(error) => error.fmt(output),
+            #[cfg(feature = "embedded-io")]
+            Self::EmbeddedIo(kind) => write!(output, "I/O error: {kind:?}"),
         }
     }
 }

@@ -1,45 +1,43 @@
 use core::fmt::Write;
 
-use crate::{CallbackResult, Error, ShellContext};
+use crate::{Error, ShellContext};
 
 /// Draws the prompt using application state and the shell's output.
-pub trait Prompt<S, R: CallbackResult = ()>: Sync {
+pub trait Prompt<S>: Sync {
     /// Writes a prompt without allocating a string.
-    fn write_prompt(&self, ctx: &mut ShellContext<'_, R, S>);
+    fn write_prompt(&self, ctx: &mut ShellContext<'_, S>);
 }
 
 /// Reports command failures and unmatched input.
 ///
 /// Output failures are returned by `run()` instead of being sent to this hook.
-pub trait ErrorHandler<S, R: CallbackResult = ()>: Sync {
+pub trait ErrorHandler<S>: Sync {
     /// Writes or otherwise handles an error for the named command.
-    fn write_error(&self, name: &str, error: &Error, ctx: &mut ShellContext<'_, R, S>);
+    fn write_error(&self, name: &str, error: &Error, ctx: &mut ShellContext<'_, S>);
 }
 
-impl<S, R: CallbackResult, F: Fn(&mut ShellContext<'_, R, S>) + Sync> Prompt<S, R> for F {
-    fn write_prompt(&self, ctx: &mut ShellContext<'_, R, S>) {
+impl<S, F: Fn(&mut ShellContext<'_, S>) + Sync> Prompt<S> for F {
+    fn write_prompt(&self, ctx: &mut ShellContext<'_, S>) {
         self(ctx);
     }
 }
 
-impl<S, R: CallbackResult, F: Fn(&str, &Error, &mut ShellContext<'_, R, S>) + Sync>
-    ErrorHandler<S, R> for F
-{
-    fn write_error(&self, name: &str, error: &Error, ctx: &mut ShellContext<'_, R, S>) {
+impl<S, F: Fn(&str, &Error, &mut ShellContext<'_, S>) + Sync> ErrorHandler<S> for F {
+    fn write_error(&self, name: &str, error: &Error, ctx: &mut ShellContext<'_, S>) {
         self(name, error, ctx);
     }
 }
 
 pub(crate) struct DefaultHandlers;
 
-impl<S, R: CallbackResult> Prompt<S, R> for DefaultHandlers {
-    fn write_prompt(&self, ctx: &mut ShellContext<'_, R, S>) {
+impl<S> Prompt<S> for DefaultHandlers {
+    fn write_prompt(&self, ctx: &mut ShellContext<'_, S>) {
         let _ = ctx.write_str("> ");
     }
 }
 
-impl<S, R: CallbackResult> ErrorHandler<S, R> for DefaultHandlers {
-    fn write_error(&self, name: &str, error: &Error, ctx: &mut ShellContext<'_, R, S>) {
+impl<S> ErrorHandler<S> for DefaultHandlers {
+    fn write_error(&self, name: &str, error: &Error, ctx: &mut ShellContext<'_, S>) {
         if name.is_empty() {
             let _ = writeln!(ctx, "{error}");
         } else {

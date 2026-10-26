@@ -4,8 +4,8 @@ use core::{
 };
 
 use crate::{
-    CallbackResult, Commands, Error, ErrorHandler, Prompt, buffer::LineBuffer,
-    handlers::DefaultHandlers, writer::ShellWriter,
+    Commands, Error, ErrorHandler, Prompt, buffer::LineBuffer, handlers::DefaultHandlers,
+    io::Output, writer::ShellWriter,
 };
 
 pub(super) const CTRL_C: u8 = 3;
@@ -55,6 +55,12 @@ pub(super) struct Editor {
     discarding: bool,
     /// Partial terminal escape sequence, retained between input bytes.
     escape: EscapeState,
+    /// The client echoes input itself, so the shell writes none of it back.
+    pub(super) client_echo: bool,
+    /// Ignore Ctrl-D on an empty line instead of ending the shell.
+    pub(super) ignore_eof: bool,
+    /// An async command was running when its `next()` future was dropped.
+    pub(super) command_running: bool,
 }
 
 impl Editor {
@@ -68,41 +74,41 @@ impl Editor {
 /// Borrowed command context with application state and formatted output.
 ///
 /// Dereferences to [`ShellState`], so application data is available as `ctx.data`.
-pub struct ShellContext<'a, R: CallbackResult = (), S = ()> {
+pub struct ShellContext<'a, S = ()> {
     state: &'a mut ShellState<S>,
-    write: &'a mut ShellWriter<R>,
-    prompt: &'a dyn Prompt<S, R>,
-    help: &'a dyn Commands<R, S>,
-    error_handler: &'a dyn ErrorHandler<S, R>,
+    write: &'a mut ShellWriter<dyn Output + Send + 'a>,
+    prompt: &'a dyn Prompt<S>,
+    help: &'a dyn Commands<S>,
+    error_handler: &'a dyn ErrorHandler<S>,
 }
 
 /// Owned storage shared by both shells, lent to handlers through `ShellContext`.
-pub(super) struct ShellStorage<'a, R: CallbackResult, S> {
+pub(super) struct ShellStorage<'a, S, O> {
     pub(super) state: ShellState<S>,
-    pub(super) write: ShellWriter<R>,
+    pub(super) write: ShellWriter<O>,
     /// Callback that draws the prompt before each input line.
-    pub(super) prompt: &'a dyn Prompt<S, R>,
+    pub(super) prompt: &'a dyn Prompt<S>,
     /// Help output for the configured command collection.
-    pub(super) help: &'a dyn Commands<R, S>,
+    pub(super) help: &'a dyn Commands<S>,
     /// Callback for command failures and unmatched input.
-    pub(super) error_handler: &'a dyn ErrorHandler<S, R>,
+    pub(super) error_handler: &'a dyn ErrorHandler<S>,
 }
 
-impl<R: CallbackResult, S> fmt::Write for ShellContext<'_, R, S> {
+impl<S> fmt::Write for ShellContext<'_, S> {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         self.write.write_str(text)
     }
 }
 
-impl<'a, R: CallbackResult> ShellStorage<'a, R, ()> {
-    /// Creates empty editing state with an output callback.
-    pub(super) fn new(write: fn(&str) -> R) -> Self {
+impl<'a, O> ShellStorage<'a, (), O> {
+    /// Creates empty editing state with an output.
+    pub(super) fn new(output: O) -> Self {
         Self {
             state: ShellState {
                 data: (),
                 editor: Editor::default(),
             },
-            write: ShellWriter::new(write),
+            write: ShellWriter::new(output),
             prompt: &DefaultHandlers,
             help: &(),
             error_handler: &DefaultHandlers,
@@ -110,9 +116,9 @@ impl<'a, R: CallbackResult> ShellStorage<'a, R, ()> {
     }
 }
 
-impl<'a, R: CallbackResult, S> ShellStorage<'a, R, S> {
+impl<'a, S, O: Output + Send> ShellStorage<'a, S, O> {
     /// Changes the application data without changing the editor or output.
-    pub(super) fn with_data<T>(self, data: T) -> ShellStorage<'a, R, T> {
+    pub(super) fn with_data<T>(self, data: T) -> ShellStorage<'a, T, O> {
         ShellStorage {
             state: ShellState {
                 data,
@@ -126,7 +132,7 @@ impl<'a, R: CallbackResult, S> ShellStorage<'a, R, S> {
     }
 
     /// Borrows editor state and output for a handler.
-    pub(super) fn context(&mut self) -> ShellContext<'_, R, S> {
+    pub(super) fn context(&mut self) -> ShellContext<'_, S> {
         ShellContext {
             state: &mut self.state,
             write: &mut self.write,
@@ -137,20 +143,20 @@ impl<'a, R: CallbackResult, S> ShellStorage<'a, R, S> {
     }
 }
 
-impl<R: CallbackResult, S> Deref for ShellContext<'_, R, S> {
+impl<S> Deref for ShellContext<'_, S> {
     type Target = ShellState<S>;
     fn deref(&self) -> &Self::Target {
         self.state
     }
 }
 
-impl<R: CallbackResult, S> DerefMut for ShellContext<'_, R, S> {
+impl<S> DerefMut for ShellContext<'_, S> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.state
     }
 }
 
-impl<R: CallbackResult, S> ShellContext<'_, R, S> {
+impl<S> ShellContext<'_, S> {
     /// Handles an input byte, including partial escape and UTF-8 sequences.
     /// Returns `true` when `line` holds a submitted command.
     pub(super) fn handle_byte(&mut self, line: &mut dyn LineBuffer, b: u8) -> bool {
@@ -163,7 +169,9 @@ impl<R: CallbackResult, S> ShellContext<'_, R, S> {
             if b == ENTER || b == b'\n' {
                 self.editor.discarding = false;
                 self.editor.clear_line(line);
-                let _ = writeln!(self.write);
+                if !self.editor.client_echo {
+                    let _ = writeln!(self.write);
+                }
                 self.report_error("", &Error::LineTooLong);
                 self.print_prompt();
             }
@@ -242,7 +250,9 @@ impl<R: CallbackResult, S> ShellContext<'_, R, S> {
             CTRL_L => self.handle_clear(line),
             ENTER | b'\n' if line.as_str().ends_with('\\') => self.continue_line(line),
             ENTER | b'\n' => {
-                let _ = writeln!(self.write);
+                if !self.editor.client_echo {
+                    let _ = writeln!(self.write);
+                }
                 return true;
             }
             BACKSPACE | CTRL_H => self.handle_backspace(line),
@@ -263,6 +273,9 @@ impl<R: CallbackResult, S> ShellContext<'_, R, S> {
             return;
         }
         self.editor.cursor += character.len_utf8();
+        if self.editor.client_echo {
+            return;
+        }
         if at_end {
             let _ = write!(self.write, "{}", character);
         } else {
@@ -271,6 +284,9 @@ impl<R: CallbackResult, S> ShellContext<'_, R, S> {
     }
 
     fn redraw_line(&mut self, line: &dyn LineBuffer) {
+        if self.editor.client_echo {
+            return;
+        }
         let _ = self.write.write_str("\r\x1b[2K");
         if self.editor.line_start == 0 {
             self.print_prompt();
@@ -308,8 +324,10 @@ impl<R: CallbackResult, S> ShellContext<'_, R, S> {
         line.remove_char(line.as_str().len() - 1);
         editor.line_start = line.as_str().len();
         editor.cursor = editor.line_start;
-        let _ = writeln!(self.write);
-        self.indent_continuation();
+        if !self.editor.client_echo {
+            let _ = writeln!(self.write);
+            self.indent_continuation();
+        }
     }
 
     /// Indents continuation lines past the prompt, like fish.
@@ -320,6 +338,19 @@ impl<R: CallbackResult, S> ShellContext<'_, R, S> {
     /// Clears a submitted line after command execution.
     pub(super) fn finish_line(&mut self, line: &mut dyn LineBuffer) {
         self.editor.clear_line(line);
+    }
+
+    /// Prints a message above the prompt, then redraws the prompt and partial input.
+    pub(super) fn print_above(&mut self, line: &dyn LineBuffer, message: impl fmt::Display) {
+        if self.editor.client_echo {
+            let _ = writeln!(self.write, "{message}");
+            return;
+        }
+        let _ = write!(self.write, "\r\x1b[2K{message}");
+        if self.write.column != 0 {
+            let _ = writeln!(self.write);
+        }
+        self.redraw_line(line);
     }
 
     /// Discards partial input and displays a keyboard interrupt.
@@ -353,7 +384,7 @@ impl<R: CallbackResult, S> ShellContext<'_, R, S> {
 
     /// Prints the registered commands, their descriptions, and aliases.
     pub fn print_help_screen(&mut self) {
-        let _ = writeln!(self, "available commands:");
+        let _ = writeln!(self, "Commands:");
         let help = self.help;
         let _ = help.write_help(self);
     }

@@ -21,6 +21,8 @@ name = "async"
 required-features = ["std"]
 
 [dependencies]
+embedded-io = { version = "0.7.1", default-features = false, optional = true }
+embedded-io-async = { version = "0.7.0", default-features = false, optional = true }
 heapless = { version = "0.9.3", default-features = false, optional = true }
 
 [dev-dependencies]
@@ -31,3 +33,4 @@ default = ["alloc"]
 alloc = []
 heapless = ["dep:heapless"]
 std = ["alloc"]
+embedded-io = ["dep:embedded-io", "dep:embedded-io-async"]

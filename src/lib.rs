@@ -40,12 +40,17 @@
 //! - `heapless`: fixed-size command storage for targets without `alloc`. Lines are
 //!   limited to 256 bytes by default. Pass a larger buffer with
 //!   `with_buffer(heapless::String::<1024>::new())`.
-//! - `std`: conversions from `std::io::Error`.
+//! - `std`: `Shell::new_std` for [`std::io`] readers and writers, and conversions
+//!   from `std::io::Error`.
+//! - `embedded-io`: `new_embedded` for [`embedded-io`](https://docs.rs/embedded-io)
+//!   writers and readers, including async readers for [`AsyncShell`].
 //!
 //! With neither `alloc` nor `heapless`, implement [`LineBuffer`] for your own storage
 //! and pass it to `with_buffer`.
 //!
-//! A line ending in `\` continues on the next line, indented past the prompt.
+//! Arguments are separated by whitespace. Wrap an argument in `"` or `'` to
+//! include spaces. A line ending in `\` continues on the next line, indented past
+//! the prompt.
 #![no_std]
 #![forbid(unsafe_code)]
 #[cfg(feature = "alloc")]
@@ -58,7 +63,7 @@ mod buffer;
 mod command;
 mod error;
 mod handlers;
-mod input;
+mod io;
 mod macros;
 mod shell;
 mod state;

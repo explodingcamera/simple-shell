@@ -1,6 +1,7 @@
 use std::{
     io::{self, Write},
     pin::Pin,
+    process::{Command, Stdio},
     sync::{LazyLock, Mutex},
     task::{Context, Poll},
     time::Duration,
@@ -25,6 +26,19 @@ fn poll_read(cx: &mut Context<'_>, buffer: &mut [u8]) -> Poll<simple_shell::Resu
         .map(|result| result.map_err(Into::into))
 }
 
+/// Lets the shell handle echo, line editing, and Ctrl-C instead of the terminal.
+fn raw_input(enable: bool) {
+    let flags = if enable {
+        ["-echo", "-icanon", "-isig"]
+    } else {
+        ["echo", "icanon", "isig"]
+    };
+    let _ = Command::new("stty")
+        .args(flags)
+        .stderr(Stdio::null())
+        .status();
+}
+
 fn main() -> simple_shell::Result {
     let commands = commands! {
         /// Show commands.
@@ -32,9 +46,15 @@ fn main() -> simple_shell::Result {
         /// Sleep for one second.
         "sleep" => async |_, _| { smol::Timer::after(Duration::from_secs(1)).await; },
         /// Exit the shell.
-        "exit" => |_, _| -> () { std::process::exit(0) },
+        "exit" => |_, _| -> () {
+            raw_input(false);
+            std::process::exit(0)
+        },
     };
 
     let mut shell = AsyncShell::new(write, poll_read).with_commands(&commands);
-    smol::block_on(shell.run())
+    raw_input(true);
+    let result = smol::block_on(shell.run());
+    raw_input(false);
+    result
 }

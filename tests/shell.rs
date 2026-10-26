@@ -15,8 +15,8 @@ use std::{
 };
 
 use simple_shell::{
-    AsyncShell, CallbackResult, CommandList, Commands, Error, ErrorHandler, Prompt, Shell,
-    ShellCommand, ShellContext, commands,
+    AsyncShell, CommandList, Commands, Error, ErrorHandler, Prompt, Shell, ShellCommand,
+    ShellContext, commands,
 };
 
 thread_local! {
@@ -87,24 +87,24 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
 
 struct TestUi;
 
-impl<R: CallbackResult> Prompt<usize, R> for TestUi {
-    fn write_prompt(&self, ctx: &mut ShellContext<'_, R, usize>) {
+impl Prompt<usize> for TestUi {
+    fn write_prompt(&self, ctx: &mut ShellContext<'_, usize>) {
         let count = ctx.data;
         let _ = write!(ctx, "app({count})> ");
     }
 }
 
-impl<R: CallbackResult> ErrorHandler<usize, R> for TestUi {
-    fn write_error(&self, name: &str, error: &Error, ctx: &mut ShellContext<'_, R, usize>) {
+impl ErrorHandler<usize> for TestUi {
+    fn write_error(&self, name: &str, error: &Error, ctx: &mut ShellContext<'_, usize>) {
         let _ = writeln!(ctx, "error[{name}]: {error}");
     }
 }
 
-fn os_prompt<R: CallbackResult>(ctx: &mut ShellContext<'_, R>) {
+fn os_prompt(ctx: &mut ShellContext<'_>) {
     let _ = ctx.write_str("os> ");
 }
 
-fn unexpected_error<R: CallbackResult>(_: &str, _: &Error, _: &mut ShellContext<'_, R>) {
+fn unexpected_error(_: &str, _: &Error, _: &mut ShellContext<'_>) {
     panic!("output error sent to command hook");
 }
 
@@ -124,7 +124,7 @@ impl Drop for DropCount<'_> {
     }
 }
 
-static STATE_COMMANDS: CommandList<'static, Result<(), &'static str>, usize> = &[
+static STATE_COMMANDS: CommandList<'static, usize> = &[
     &ShellCommand::new(&["increment", "i"], |_, shell| shell.data += 1)
         .with_help("Increment the counter."),
     &ShellCommand::new(&["stop"], |_, shell| {
@@ -136,11 +136,11 @@ static STATE_COMMANDS: CommandList<'static, Result<(), &'static str>, usize> = &
 #[test]
 fn custom_command_set_needs_no_help_implementation() {
     struct CustomCommands;
-    impl Commands<(), usize> for CustomCommands {
+    impl Commands<usize> for CustomCommands {
         async fn run(
             &self,
             argv: &[&str],
-            ctx: &mut ShellContext<'_, (), usize>,
+            ctx: &mut ShellContext<'_, usize>,
         ) -> simple_shell::Result {
             match argv {
                 ["increment"] => {
@@ -226,7 +226,7 @@ fn async_commands_borrow_state() {
     let mut count = 0usize;
     let manual = ShellCommand::new_async(
         &["manual", "m"],
-        async |args, shell: &mut ShellContext<'_, (), &mut usize>| {
+        async |args, shell: &mut ShellContext<'_, &mut usize>| {
             assert_eq!(args, ["m", "hello"]);
             *shell.data += 1;
         },
@@ -234,10 +234,10 @@ fn async_commands_borrow_state() {
     .with_help("manual increment");
     let commands = commands! {
         manual,
-        "inline" | "i" => async |_, shell: &mut ShellContext<'_, (), &mut usize>| {
+        "inline" | "i" => async |_, shell: &mut ShellContext<'_, &mut usize>| {
             *shell.data += 1;
         },
-        "sync" => |_, shell: &mut ShellContext<'_, (), &mut usize>| *shell.data += 1,
+        "sync" => |_, shell: &mut ShellContext<'_, &mut usize>| *shell.data += 1,
     };
     INPUT.with(|input| input.borrow_mut().extend(b"m hello\ni\nsync\n"));
     let mut shell = AsyncShell::new(write, poll_read)
@@ -271,7 +271,7 @@ fn async_errors_and_fallback() {
     OUTPUT.with(|output| {
         let output = output.borrow();
         assert!(output.contains("fail: failed\n"));
-        assert!(output.contains("available commands:"));
+        assert!(output.contains("Commands:"));
     });
 }
 
@@ -567,7 +567,7 @@ fn blocking_shell_uses_custom_prompt() {
         let output = output.borrow();
         assert!(output.starts_with("os> "));
         assert!(output.contains("^C\nos> "));
-        assert!(output.contains("available commands:"));
+        assert!(output.contains("Commands:"));
     });
 }
 
@@ -585,7 +585,7 @@ fn output_errors_stop_the_shell() {
             };
             if async_mode {
                 let mut shell = AsyncShell::new(fallible_write, poll_read)
-                    .with_error_handler(&unexpected_error::<Result<(), &'static str>>)
+                    .with_error_handler(&unexpected_error)
                     .with_commands(&commands);
                 let mut run = pin!(shell.run());
                 assert!(matches!(
@@ -594,7 +594,7 @@ fn output_errors_stop_the_shell() {
                 ));
             } else {
                 let mut shell = Shell::new(fallible_write, read)
-                    .with_error_handler(&unexpected_error::<Result<(), &'static str>>)
+                    .with_error_handler(&unexpected_error)
                     .with_commands(&commands);
                 assert!(matches!(shell.run(), Err(Error::Message("output failed"))));
             }

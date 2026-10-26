@@ -5,6 +5,7 @@ use simple_shell::{AsyncShell, Error, Result, Shell, commands};
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
+    fmt::Write,
     future::Future,
     pin::pin,
     sync::atomic::{AtomicUsize, Ordering},
@@ -114,4 +115,133 @@ fn eof_drops_pending_command() {
         AsyncShell::new(write, |_, buffer| Poll::Ready(read(buffer))).with_commands(&commands);
     assert!(smol::block_on(shell.run()).is_ok());
     assert_eq!(drops.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn skips_echo_for_echoing_clients() {
+    INPUT.with(|input| input.borrow_mut().extend(b"echo hi \\\nthere\n"));
+    let commands = commands! {
+        "echo" => |argv, shell| { let _ = writeln!(shell, "{}", argv[1..].join(" ")); },
+    };
+    Shell::new(write, read)
+        .with_echo(false)
+        .with_commands(&commands)
+        .run()
+        .expect("output succeeds");
+    OUTPUT.with(|output| assert_eq!(*output.borrow(), "> hi there\n> "));
+}
+
+#[test]
+fn parses_quoted_arguments() {
+    INPUT.with(|input| {
+        input
+            .borrow_mut()
+            .extend(b"echo \"a b\" 'c d' e\"f \"\"\necho \"oops\n")
+    });
+    let commands = commands! {
+        "echo" => |argv, shell| { let _ = writeln!(shell, "{}", argv[1..].join("|")); },
+    };
+    Shell::new(write, read)
+        .with_echo(false)
+        .with_commands(&commands)
+        .run()
+        .expect("output succeeds");
+    OUTPUT.with(|output| assert_eq!(*output.borrow(), "> a b|c d|e\"f|\n> unclosed quote\n> "));
+}
+
+#[test]
+fn ignores_ctrl_d_when_configured() {
+    INPUT.with(|input| input.borrow_mut().extend(b"\x04count\n"));
+    let commands = commands! {
+        "count" => |_, shell| { shell.data += 1; },
+    };
+    let mut shell = Shell::new(write, read)
+        .with_ignore_eof(true)
+        .with_state(0usize)
+        .with_commands(&commands);
+    shell.run().expect("output succeeds");
+    assert_eq!(shell.data, 1);
+}
+
+#[test]
+fn writes_crlf_line_endings() {
+    INPUT.with(|input| input.borrow_mut().extend(b"lines\n"));
+    let commands = commands! {
+        "lines" => |_, shell| { let _ = write!(shell, "a\nb\r\n"); },
+    };
+    Shell::new(write, read)
+        .with_crlf(true)
+        .with_commands(&commands)
+        .run()
+        .expect("output succeeds");
+    OUTPUT.with(|output| assert_eq!(*output.borrow(), "> lines\r\na\r\nb\r\n> "));
+}
+
+#[test]
+fn prints_above_partial_input() {
+    let commands = commands! { "ls" => |_, _| {} };
+    let mut shell = Shell::new(write, |_| Ok(0)).with_commands(&commands);
+    shell.context().print_prompt();
+    for byte in *b"ls" {
+        assert!(shell.feed(byte).expect("output succeeds"));
+    }
+    shell.print_above("log").expect("output succeeds");
+    assert_eq!(shell.command(), "ls");
+    OUTPUT.with(|output| {
+        assert_eq!(
+            *output.borrow(),
+            "> ls\r\x1b[2Klog\n\r\x1b[2K> ls\x1b7\x1b8"
+        );
+    });
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn runs_with_std_io() {
+    let mut output = Vec::new();
+    let commands = commands! { "hi" => |_, shell| { let _ = writeln!(shell, "hello"); } };
+    Shell::new_std(&mut output, &b"hi\n"[..])
+        .with_commands(&commands)
+        .run()
+        .expect("output succeeds");
+    assert_eq!(output, b"> hi\nhello\n> ");
+}
+
+#[cfg(feature = "embedded-io")]
+#[test]
+fn runs_with_embedded_io() {
+    let commands = commands! { "hi" => |_, shell| { let _ = writeln!(shell, "hello"); } };
+    let mut output = [0; 32];
+    Shell::new_embedded(&mut output[..], &b"hi\n"[..])
+        .with_commands(&commands)
+        .run()
+        .expect("output succeeds");
+    assert!(output.starts_with(b"> hi\nhello\n> "));
+    let mut output = [0; 32];
+    smol::block_on(
+        AsyncShell::new_embedded(&mut output[..], &b"hi\n"[..])
+            .with_commands(&commands)
+            .run(),
+    )
+    .expect("output succeeds");
+    assert!(output.starts_with(b"> hi\nhello\n> "));
+}
+
+#[test]
+fn next_recovers_after_cancelled_command() {
+    INPUT.with(|input| input.borrow_mut().extend(b"wait\n"));
+    let commands = commands! { "wait" => async |_, _| core::future::pending::<()>().await };
+    let mut shell = AsyncShell::new(write, poll_read).with_commands(&commands);
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..4 {
+        assert!(matches!(
+            pin!(shell.next()).poll(&mut cx),
+            Poll::Ready(Ok(true))
+        ));
+    }
+    // Dropping the future while the command runs cancels it.
+    assert!(pin!(shell.next()).poll(&mut cx).is_pending());
+    assert!(pin!(shell.next()).poll(&mut cx).is_pending());
+    assert_eq!(shell.command(), "");
+    OUTPUT.with(|output| assert_eq!(*output.borrow(), "wait\n^C\n> "));
 }

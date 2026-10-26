@@ -1,151 +1,122 @@
-use core::{
-    fmt::Write,
-    ops::{Deref, DerefMut},
-};
+use core::fmt::Write;
 
+#[cfg(feature = "embedded-io")]
+use crate::io::EmbeddedIo;
+#[cfg(feature = "std")]
+use crate::io::StdIo;
 use crate::{
-    CallbackResult, ErrorHandler, Prompt, Result, ShellContext, ShellState, SyncCommands,
+    CallbackResult, Result, SyncCommands,
     buffer::{Arguments, DefaultBuffer, LineBuffer},
-    input::Input,
+    io::{Input, InputBuffer, Output},
+    macros::impl_shell,
     state::{CTRL_D, ShellStorage},
 };
 
 /// An interactive shell with blocking input.
-pub struct Shell<'a, R: CallbackResult = (), S = (), C = (), B = DefaultBuffer> {
-    storage: ShellStorage<'a, R, S>,
-    read: fn(&mut [u8]) -> Result<usize>,
-    input: Input,
+pub struct Shell<'a, O, I, S = (), C = (), B = DefaultBuffer> {
+    storage: ShellStorage<'a, S, O>,
+    input: I,
+    buffer: InputBuffer,
     line: B,
     commands: &'a C,
 }
 
-impl<'a, R: CallbackResult> Shell<'a, R> {
+impl<'a> Shell<'a, (), ()> {
     /// Creates a shell with output and blocking input functions.
     ///
-    /// `read` fills the supplied buffer and returns its byte count, or `Ok(0)` for EOF.
-    pub fn new(write: fn(&str) -> R, read: fn(&mut [u8]) -> Result<usize>) -> Self {
+    /// Both can be closures that capture state. `read` fills the supplied buffer and
+    /// returns its byte count, or `Ok(0)` at the end of input.
+    pub fn new<W, R, F>(write: W, read: F) -> Shell<'a, W, F>
+    where
+        W: FnMut(&str) -> R + Send,
+        R: CallbackResult,
+        F: FnMut(&mut [u8]) -> Result<usize>,
+    {
+        Shell::with_io(write, read)
+    }
+
+    /// Creates a shell from a [`std::io::Write`] writer and a [`std::io::Read`] reader.
+    #[cfg(feature = "std")]
+    pub fn new_std<W: std::io::Write + Send, R: std::io::Read>(
+        writer: W,
+        reader: R,
+    ) -> Shell<'a, StdIo<W>, StdIo<R>> {
+        Shell::with_io(StdIo(writer), StdIo(reader))
+    }
+
+    /// Creates a shell from an [`embedded_io::Write`] writer and an
+    /// [`embedded_io::Read`] reader, such as the halves of a UART.
+    #[cfg(feature = "embedded-io")]
+    pub fn new_embedded<W: embedded_io::Write + Send, R: embedded_io::Read>(
+        writer: W,
+        reader: R,
+    ) -> Shell<'a, EmbeddedIo<W>, EmbeddedIo<R>> {
+        Shell::with_io(EmbeddedIo(writer), EmbeddedIo(reader))
+    }
+}
+
+impl<'a, O: Output + Send, I: Input> Shell<'a, O, I> {
+    fn with_io(output: O, input: I) -> Self {
         Self {
-            storage: ShellStorage::new(write),
-            read,
-            input: Input::new(),
+            storage: ShellStorage::new(output),
+            input,
+            buffer: InputBuffer::new(),
             line: DefaultBuffer::default(),
             commands: &(),
         }
     }
 }
 
-impl<'a, R: CallbackResult, S, C, B: LineBuffer> Shell<'a, R, S, C, B> {
-    /// Attaches application data, available to handlers as `ctx.data`.
-    /// Configure this first. Changing state resets the commands and hooks.
-    pub fn with_state<T>(self, data: T) -> Shell<'a, R, T, (), B> {
-        Shell {
-            storage: self.storage.with_data(data),
-            read: self.read,
-            input: self.input,
-            line: self.line,
-            commands: &(),
-        }
-    }
+impl_shell!(Shell, Input, SyncCommands);
 
-    /// Sets the borrowed command collection, replacing any previous collection.
-    pub fn with_commands<T: SyncCommands<R, S>>(self, commands: &'a T) -> Shell<'a, R, S, T, B> {
-        let mut storage = self.storage;
-        storage.help = commands;
-        Shell {
-            storage,
-            read: self.read,
-            input: self.input,
-            line: self.line,
-            commands,
-        }
-    }
-
-    /// Sets the prompt writer. The default writes `"> "`.
-    pub fn with_prompt<P: Prompt<S, R>>(mut self, prompt: &'a P) -> Self {
-        self.storage.prompt = prompt;
-        self
-    }
-
-    /// Sets the handler for command errors and unmatched input.
-    pub fn with_error_handler<H: ErrorHandler<S, R>>(mut self, handler: &'a H) -> Self {
-        self.storage.error_handler = handler;
-        self
-    }
-
-    /// Replaces the command line storage, for example with a `heapless::String<N>`.
+impl<O: Output + Send, I: Input, S, C: SyncCommands<S>, B: LineBuffer> Shell<'_, O, I, S, C, B> {
+    /// Processes one input byte and runs the command when a line is submitted.
     ///
-    /// Lines that do not fit in fixed-size storage are rejected.
-    pub fn with_buffer<T: LineBuffer>(self, buffer: T) -> Shell<'a, R, S, C, T> {
-        Shell {
-            storage: self.storage,
-            read: self.read,
-            input: self.input,
-            line: buffer,
-            commands: self.commands,
+    /// Use it to drive the shell from a main loop or an interrupt handler instead of
+    /// [`Self::run`]. The shell's input is unused, so create it with a placeholder
+    /// such as `|_| Ok(0)`. Print the first prompt with `shell.context().print_prompt()`.
+    /// Returns `Ok(false)` after Ctrl-D on an empty line.
+    pub fn feed(&mut self, byte: u8) -> Result<bool> {
+        self.storage.write.take_error()?;
+        if byte == CTRL_D && self.line.as_str().is_empty() && !self.storage.state.editor.ignore_eof
+        {
+            let _ = writeln!(self.context());
+            self.storage.write.take_error()?;
+            return Ok(false);
         }
+        if self.storage.context().handle_byte(&mut self.line, byte) {
+            self.storage.write.take_error()?;
+            let mut ctx = self.storage.context();
+            match Arguments::parse(self.line.as_str()) {
+                Ok(argv) => {
+                    if let Some(name) = argv.first()
+                        && let Err(error) = self.commands.run_sync(&argv, &mut ctx)
+                    {
+                        ctx.report_error(name, &error);
+                    }
+                }
+                Err(error) => ctx.report_error("", &error),
+            }
+            ctx.finish_line(&mut self.line);
+            ctx.print_prompt();
+        }
+        self.storage.write.take_error()?;
+        Ok(true)
     }
 
-    /// Returns the line being edited.
-    pub fn command(&self) -> &str {
-        self.line.as_str()
-    }
-
-    /// Returns the cursor's byte offset in [`Self::command`], always at a character boundary.
-    pub fn cursor(&self) -> usize {
-        self.storage.state.editor.cursor
-    }
-
-    /// Borrows the shell's application state and formatted output.
-    pub fn context(&mut self) -> ShellContext<'_, R, S> {
-        self.storage.context()
-    }
-
-    /// Runs until EOF, Ctrl-D on an empty line, or an I/O error.
+    /// Runs until the end of input, Ctrl-D on an empty line, or an I/O error.
     ///
     /// Returns the first output error without writing again.
-    pub fn run(&mut self) -> Result
-    where
-        C: SyncCommands<R, S>,
-    {
+    pub fn run(&mut self) -> Result {
         self.context().print_prompt();
         loop {
             self.storage.write.take_error()?;
-            let Some(byte) = self.input.read(self.read)? else {
+            let Some(byte) = self.buffer.read(&mut self.input)? else {
                 return Ok(());
             };
-            if byte == CTRL_D && self.line.as_str().is_empty() {
-                let _ = writeln!(self.context());
-                return self.storage.write.take_error();
-            }
-            if self.storage.context().handle_byte(&mut self.line, byte) {
-                self.storage.write.take_error()?;
-                let mut ctx = self.storage.context();
-                match Arguments::parse(self.line.as_str()) {
-                    Ok(argv) => {
-                        if let Some(name) = argv.first()
-                            && let Err(error) = self.commands.run_sync(&argv, &mut ctx)
-                        {
-                            ctx.report_error(name, &error);
-                        }
-                    }
-                    Err(error) => ctx.report_error("", &error),
-                }
-                ctx.finish_line(&mut self.line);
-                ctx.print_prompt();
+            if !self.feed(byte)? {
+                return Ok(());
             }
         }
-    }
-}
-
-impl<R: CallbackResult, S, C, B> Deref for Shell<'_, R, S, C, B> {
-    type Target = ShellState<S>;
-    fn deref(&self) -> &Self::Target {
-        &self.storage.state
-    }
-}
-
-impl<R: CallbackResult, S, C, B> DerefMut for Shell<'_, R, S, C, B> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.storage.state
     }
 }

@@ -14,8 +14,8 @@ fn empty_names_do_not_match() {
         shell.data += 10usize;
     });
     let commands = commands! { unnamed, named, fallback };
-    let list: CommandList<'_, (), usize> = &[&unnamed, &named, &fallback];
-    for set in [&commands as &dyn SyncCommands<(), usize>, &list] {
+    let list: CommandList<'_, usize> = &[&unnamed, &named, &fallback];
+    for set in [&commands as &dyn SyncCommands<usize>, &list] {
         let mut shell = Shell::new(|_| {}, |_| Ok(0)).with_state(0usize);
         set.run_sync(&[], &mut shell.context())
             .expect("empty input is ignored");
@@ -74,7 +74,7 @@ fn builds_const_async_commands() {
         .write_help(&mut help)
         .expect("String output succeeds");
     assert!(help.contains("Show commands."));
-    assert!(help.contains("aliases: h"));
+    assert!(help.contains("  help, h       Show commands.\n"));
     assert!(help.contains("Return a result."));
     let mut shell =
         AsyncShell::new(|_| {}, |_, _| core::task::Poll::Pending).with_commands(&commands);
@@ -98,18 +98,18 @@ fn async_move_captures_state() {
 
 #[test]
 fn calls_function_paths() {
-    fn increment(_: &[&str], shell: &mut ShellContext<'_, (), usize>) {
+    fn increment(_: &[&str], shell: &mut ShellContext<'_, usize>) {
         shell.data += 1;
     }
-    async fn increment_async(argv: &[&str], shell: &mut ShellContext<'_, (), usize>) {
+    async fn increment_async(argv: &[&str], shell: &mut ShellContext<'_, usize>) {
         increment(argv, shell);
     }
     struct Handlers;
     impl Handlers {
-        fn increment(argv: &[&str], shell: &mut ShellContext<'_, (), usize>) {
+        fn increment(argv: &[&str], shell: &mut ShellContext<'_, usize>) {
             increment(argv, shell);
         }
-        async fn increment_async(argv: &[&str], shell: &mut ShellContext<'_, (), usize>) {
+        async fn increment_async(argv: &[&str], shell: &mut ShellContext<'_, usize>) {
             increment_async(argv, shell).await;
         }
     }

@@ -104,12 +104,33 @@ pub(super) struct Arguments<'a> {
     len: usize,
 }
 
+/// Splits a line at whitespace. A word that starts with `"` or `'` runs to the
+/// matching quote, and the quotes are removed. Quotes inside a word are kept.
+fn split_words(line: &str) -> impl Iterator<Item = Result<&str>> {
+    let mut rest = line;
+    core::iter::from_fn(move || {
+        rest = rest.trim_start();
+        let (word, remaining) = match rest.chars().next()? {
+            quote @ ('"' | '\'') => match rest[1..].split_once(quote) {
+                Some(split) => split,
+                None => {
+                    rest = "";
+                    return Some(Err(crate::Error::UnclosedQuote));
+                }
+            },
+            _ => rest.split_once(char::is_whitespace).unwrap_or((rest, "")),
+        };
+        rest = remaining;
+        Some(Ok(word))
+    })
+}
+
 impl<'a> Arguments<'a> {
     pub(super) fn parse(line: &'a str) -> Result<Self> {
         #[cfg(feature = "alloc")]
         {
             Ok(Self {
-                args: line.split_whitespace().collect(),
+                args: split_words(line).collect::<Result<_>>()?,
             })
         }
         #[cfg(not(feature = "alloc"))]
@@ -118,7 +139,8 @@ impl<'a> Arguments<'a> {
                 args: [""; 64],
                 len: 0,
             };
-            for arg in line.split_whitespace() {
+            for arg in split_words(line) {
+                let arg = arg?;
                 if result.len == result.args.len() {
                     return Err(crate::Error::TooManyArguments);
                 }

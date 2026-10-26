@@ -22,18 +22,18 @@ pub trait CommandInfo: Sync {
 }
 
 /// A synchronous command that can be stored in a borrowed [`CommandList`].
-pub trait Command<R: CallbackResult = (), S = ()>: CommandInfo {
+pub trait Command<S = ()>: CommandInfo {
     /// Runs the handler. `argv[0]` is the invoked name.
-    fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, R, S>) -> Result;
+    fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, S>) -> Result;
 }
 
 /// A command whose concrete future is retained by a typed command list.
-pub trait AsyncCommand<R: CallbackResult = (), S = ()>: CommandInfo {
+pub trait AsyncCommand<S = ()>: CommandInfo {
     /// Runs the handler without boxing its future.
     fn run_async(
         &self,
         args: &[&str],
-        shell: &mut ShellContext<'_, R, S>,
+        shell: &mut ShellContext<'_, S>,
     ) -> impl core::future::Future<Output = Result>;
 }
 
@@ -42,7 +42,7 @@ pub trait AsyncCommand<R: CallbackResult = (), S = ()>: CommandInfo {
 /// Use `CommandList<'static>` with manual [`ShellCommand`] constructors for static lists.
 /// [`commands!`](crate::commands) retains concrete handler types instead.
 /// This alias does not allocate or own commands.
-pub type CommandList<'a, R = (), S = ()> = &'a [&'a dyn Command<R, S>];
+pub type CommandList<'a, S = ()> = &'a [&'a dyn Command<S>];
 
 /// Marks an async callback without allocating or erasing its future.
 #[doc(hidden)]
@@ -52,20 +52,19 @@ pub struct Async<F>(F);
 ///
 /// The handler receives an argument vector including the invoked name at index
 /// zero. It can return `()` or a result whose error converts to [`Error`].
-pub struct ShellCommand<'a, R: CallbackResult, F, S = ()> {
+pub struct ShellCommand<'a, F, S = ()> {
     /// Description shown by [`ShellContext::print_help_screen`].
     pub help: &'a str,
     /// Handler for the command. Errors are printed with the command name.
     pub func: F,
     /// Primary name followed by aliases.
     pub names: &'a [&'a str],
-    output: PhantomData<fn() -> (R, S)>,
+    output: PhantomData<fn() -> S>,
 }
 
-impl<'a, R, F, C, S> ShellCommand<'a, R, F, S>
+impl<'a, F, C, S> ShellCommand<'a, F, S>
 where
-    R: CallbackResult,
-    F: Fn(&[&str], &mut ShellContext<'_, R, S>) -> C + Sync,
+    F: Fn(&[&str], &mut ShellContext<'_, S>) -> C + Sync,
     C: CallbackResult,
 {
     /// Creates a command with its primary name, aliases, and handler.
@@ -79,16 +78,13 @@ where
     }
 }
 
-impl<'a, R, F, S> ShellCommand<'a, R, F, S>
-where
-    R: CallbackResult,
-{
+impl<'a, F, S> ShellCommand<'a, F, S> {
     /// Creates an async command without boxing its future.
     ///
     /// Async commands can only be registered with [`AsyncShell`](crate::AsyncShell).
-    pub const fn new_async<C>(names: &'a [&'a str], func: F) -> ShellCommand<'a, R, Async<F>, S>
+    pub const fn new_async<C>(names: &'a [&'a str], func: F) -> ShellCommand<'a, Async<F>, S>
     where
-        F: AsyncFn(&[&str], &mut ShellContext<'_, R, S>) -> C + Sync,
+        F: AsyncFn(&[&str], &mut ShellContext<'_, S>) -> C + Sync,
         C: CallbackResult,
     {
         ShellCommand {
@@ -106,7 +102,7 @@ where
     }
 }
 
-impl<R: CallbackResult, F: Sync, S> CommandInfo for ShellCommand<'_, R, F, S> {
+impl<F: Sync, S> CommandInfo for ShellCommand<'_, F, S> {
     fn help(&self) -> &str {
         self.help
     }
@@ -116,39 +112,36 @@ impl<R: CallbackResult, F: Sync, S> CommandInfo for ShellCommand<'_, R, F, S> {
     }
 }
 
-impl<R, F, C, S> Command<R, S> for ShellCommand<'_, R, F, S>
+impl<F, C, S> Command<S> for ShellCommand<'_, F, S>
 where
-    R: CallbackResult,
-    F: Fn(&[&str], &mut ShellContext<'_, R, S>) -> C + Sync,
+    F: Fn(&[&str], &mut ShellContext<'_, S>) -> C + Sync,
     C: CallbackResult,
 {
-    fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, R, S>) -> Result {
+    fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, S>) -> Result {
         (self.func)(argv, ctx).into_result()
     }
 }
 
-impl<R, F, C, S> AsyncCommand<R, S> for ShellCommand<'_, R, F, S>
+impl<F, C, S> AsyncCommand<S> for ShellCommand<'_, F, S>
 where
-    R: CallbackResult,
-    F: Fn(&[&str], &mut ShellContext<'_, R, S>) -> C + Sync,
+    F: Fn(&[&str], &mut ShellContext<'_, S>) -> C + Sync,
     C: CallbackResult,
 {
     fn run_async(
         &self,
         args: &[&str],
-        shell: &mut ShellContext<'_, R, S>,
+        shell: &mut ShellContext<'_, S>,
     ) -> impl core::future::Future<Output = Result> {
         core::future::ready(self.run(args, shell))
     }
 }
 
-impl<R, F, C, S> AsyncCommand<R, S> for ShellCommand<'_, R, Async<F>, S>
+impl<F, C, S> AsyncCommand<S> for ShellCommand<'_, Async<F>, S>
 where
-    R: CallbackResult,
-    F: AsyncFn(&[&str], &mut ShellContext<'_, R, S>) -> C + Sync,
+    F: AsyncFn(&[&str], &mut ShellContext<'_, S>) -> C + Sync,
     C: CallbackResult,
 {
-    async fn run_async(&self, args: &[&str], shell: &mut ShellContext<'_, R, S>) -> Result {
+    async fn run_async(&self, args: &[&str], shell: &mut ShellContext<'_, S>) -> Result {
         (self.func.0)(args, shell).await.into_result()
     }
 }
@@ -157,47 +150,71 @@ where
 ///
 /// Implement this for custom command execution. Help output is optional and
 /// defaults to nothing. [`crate::commands!`] supplies both execution and help.
-pub trait Commands<R: CallbackResult = (), S = ()>: Sync {
+pub trait Commands<S = ()>: Sync {
     /// Writes descriptions for the built-in help screen.
     fn write_help(&self, _: &mut dyn Write) -> fmt::Result {
         Ok(())
     }
 
     /// Runs a command, returning [`Error::CommandNotFound`] if none matched.
-    fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, R, S>) -> impl Future<Output = Result>
+    fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, S>) -> impl Future<Output = Result>
     where
         Self: Sized;
 }
 
 /// A command set that can also execute in a blocking [`crate::Shell`].
-pub trait SyncCommands<R: CallbackResult = (), S = ()>: Commands<R, S> {
+pub trait SyncCommands<S = ()>: Commands<S> {
     /// Runs a matching command synchronously. `argv[0]` is the invoked name.
-    fn run_sync(&self, argv: &[&str], ctx: &mut ShellContext<'_, R, S>) -> Result;
+    fn run_sync(&self, argv: &[&str], ctx: &mut ShellContext<'_, S>) -> Result;
 }
 
+/// Column where descriptions start in the help screen.
+const HELP_COLUMN: usize = 16;
+
+/// Writes one help line in the style of GNU `--help` output: names and aliases,
+/// then the description aligned at [`HELP_COLUMN`].
 fn write_entry(output: &mut dyn Write, command: &dyn CommandInfo) -> fmt::Result {
-    let Some((name, aliases)) = command.names().split_first() else {
-        return Ok(());
-    };
-    if name.is_empty() {
+    let names = command.names();
+    if names.first().is_none_or(|name| name.is_empty()) {
         return Ok(());
     }
-    write!(output, "  {name:<12}{:<25}", command.help())?;
-    for (index, alias) in aliases.iter().enumerate() {
-        output.write_str(if index == 0 { "    aliases: " } else { ", " })?;
-        output.write_str(alias)?;
+    output.write_str("  ")?;
+    let mut width = 2;
+    for (index, name) in names.iter().enumerate() {
+        if index > 0 {
+            output.write_str(", ")?;
+            width += 2;
+        }
+        output.write_str(name)?;
+        width += name.chars().count();
     }
-    output.write_char('\n')
+    if command.help().is_empty() {
+        return output.write_char('\n');
+    }
+    // Names too long for the column put the description on the next line.
+    if width + 2 > HELP_COLUMN {
+        output.write_char('\n')?;
+        width = 0;
+    }
+    for (index, line) in command.help().lines().enumerate() {
+        let indent = if index == 0 {
+            HELP_COLUMN - width
+        } else {
+            HELP_COLUMN
+        };
+        writeln!(output, "{:indent$}{line}", "")?;
+    }
+    Ok(())
 }
 
-impl<R: CallbackResult, S> Commands<R, S> for () {
-    fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, R, S>) -> impl Future<Output = Result> {
+impl<S> Commands<S> for () {
+    fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, S>) -> impl Future<Output = Result> {
         ready(self.run_sync(argv, ctx))
     }
 }
 
-impl<R: CallbackResult, S> SyncCommands<R, S> for () {
-    fn run_sync(&self, argv: &[&str], _: &mut ShellContext<'_, R, S>) -> Result {
+impl<S> SyncCommands<S> for () {
+    fn run_sync(&self, argv: &[&str], _: &mut ShellContext<'_, S>) -> Result {
         if argv.is_empty() {
             Ok(())
         } else {
@@ -206,7 +223,7 @@ impl<R: CallbackResult, S> SyncCommands<R, S> for () {
     }
 }
 
-impl<R: CallbackResult, S> Commands<R, S> for CommandList<'_, R, S> {
+impl<S> Commands<S> for CommandList<'_, S> {
     fn write_help(&self, output: &mut dyn Write) -> fmt::Result {
         for command in *self {
             write_entry(output, *command)?;
@@ -214,13 +231,13 @@ impl<R: CallbackResult, S> Commands<R, S> for CommandList<'_, R, S> {
         Ok(())
     }
 
-    async fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, R, S>) -> Result {
+    async fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, S>) -> Result {
         self.run_sync(argv, ctx)
     }
 }
 
-impl<R: CallbackResult, S> SyncCommands<R, S> for CommandList<'_, R, S> {
-    fn run_sync(&self, argv: &[&str], ctx: &mut ShellContext<'_, R, S>) -> Result {
+impl<S> SyncCommands<S> for CommandList<'_, S> {
+    fn run_sync(&self, argv: &[&str], ctx: &mut ShellContext<'_, S>) -> Result {
         let Some(name) = argv.first() else {
             return Ok(());
         };
@@ -231,18 +248,17 @@ impl<R: CallbackResult, S> SyncCommands<R, S> for CommandList<'_, R, S> {
     }
 }
 
-impl<R, S, C, T> Commands<R, S> for (&C, T)
+impl<S, C, T> Commands<S> for (&C, T)
 where
-    R: CallbackResult,
-    C: AsyncCommand<R, S>,
-    T: Commands<R, S>,
+    C: AsyncCommand<S>,
+    T: Commands<S>,
 {
     fn write_help(&self, output: &mut dyn Write) -> fmt::Result {
         write_entry(output, self.0)?;
         self.1.write_help(output)
     }
 
-    async fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, R, S>) -> Result {
+    async fn run(&self, argv: &[&str], ctx: &mut ShellContext<'_, S>) -> Result {
         if argv.first().is_some_and(|name| self.0.matches(name)) {
             self.0.run_async(argv, ctx).await
         } else {
@@ -251,13 +267,12 @@ where
     }
 }
 
-impl<R, S, C, T> SyncCommands<R, S> for (&C, T)
+impl<S, C, T> SyncCommands<S> for (&C, T)
 where
-    R: CallbackResult,
-    C: Command<R, S> + AsyncCommand<R, S>,
-    T: SyncCommands<R, S>,
+    C: Command<S> + AsyncCommand<S>,
+    T: SyncCommands<S>,
 {
-    fn run_sync(&self, argv: &[&str], ctx: &mut ShellContext<'_, R, S>) -> Result {
+    fn run_sync(&self, argv: &[&str], ctx: &mut ShellContext<'_, S>) -> Result {
         if argv.first().is_some_and(|name| self.0.matches(name)) {
             self.0.run(argv, ctx)
         } else {
